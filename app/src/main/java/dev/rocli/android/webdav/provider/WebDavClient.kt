@@ -218,34 +218,34 @@ class WebDavClient(
         }
     }
 
-    private fun buildApiService(context: Context, url: HttpUrl, creds: Pair<String, String>?): WebDavService {
-        val builder = OkHttpClient.Builder().apply {
-            if (clientCert != null || !verify) {
-                useCustomTLS(context, clientCert, verify)
-            }
-        }
-        if (noHttp2) {
-            builder.protocols(listOf(Protocol.HTTP_1_1))
-        }
-        if (BuildConfig.DEBUG) {
-            val logging = HttpLoggingInterceptor()
-            logging.level = HttpLoggingInterceptor.Level.BASIC
-            builder.addInterceptor(logging)
-        }
-        if (creds != null) {
-            val auth = Credentials.basic(creds.first, creds.second)
-            builder.addInterceptor(AuthInterceptor(auth))
-        }
-
-        val serializer = buildSerializer()
-        val converter = SimpleXmlConverterFactory.create(serializer)
-        return Retrofit.Builder()
-            .baseUrl(url)
-            .client(builder.build())
-            .addConverterFactory(converter)
-            .build()
-            .create(WebDavService::class.java)
-    }
+//    private fun buildApiService(context: Context, url: HttpUrl, creds: Pair<String, String>?): WebDavService {
+//        val builder = OkHttpClient.Builder().apply {
+//            if (clientCert != null || !verify) {
+//                useCustomTLS(context, clientCert, verify)
+//            }
+//        }
+//        if (noHttp2) {
+//            builder.protocols(listOf(Protocol.HTTP_1_1))
+//        }
+//        if (BuildConfig.DEBUG) {
+//            val logging = HttpLoggingInterceptor()
+//            logging.level = HttpLoggingInterceptor.Level.BASIC
+//            builder.addInterceptor(logging)
+//        }
+//        if (creds != null) {
+//            val auth = Credentials.basic(creds.first, creds.second)
+//            builder.addInterceptor(AuthInterceptor(auth))
+//        }
+//
+//        val serializer = buildSerializer()
+//        val converter = SimpleXmlConverterFactory.create(serializer)
+//        return Retrofit.Builder()
+//            .baseUrl(url)
+//            .client(builder.build())
+//            .addConverterFactory(converter)
+//            .build()
+//            .create(WebDavService::class.java)
+//    }
 
     private fun OkHttpClient.Builder.useCustomTLS(context: Context, clientCert: String?, verify: Boolean): OkHttpClient.Builder {
         val sslContext = SSLContext.getInstance("TLS")
@@ -334,4 +334,129 @@ class WebDavClient(
         registry.bind(Property::class.java, Property.PropertyConverter::class.java)
         return serializer
     }
+
+    private class DigestAuthenticator(
+        private val username: String,
+        private val password: String
+    ) : Authenticator {
+
+        private val nonceCount: MutableMap<String, Int> = mutableMapOf()
+
+        override fun authenticate(route: Route?, response: Response): Request? {
+            if (response.request.header("Authorization") != null) {
+                return null // 이미 인증 시도가 실패했기 때문에 더 이상 시도하지 않음
+            }
+
+            val challengeHeader = response.header("WWW-Authenticate") ?: return null
+            val challenges = parseChallenges(challengeHeader)
+
+            val challenge = challenges.firstOrNull { it.scheme.equals("Digest", ignoreCase = true) }
+                ?: return null
+
+            val nonce = challenge.parameters["nonce"] ?: return null
+            val realm = challenge.parameters["realm"] ?: return null
+            val qop = challenge.parameters["qop"] ?: return null
+            val opaque = challenge.parameters["opaque"] ?: ""
+            val algorithm = challenge.parameters["algorithm"] ?: "MD5"
+
+            // Nonce count 관리
+            val nc = nonceCount.compute(nonce) { _, count -> (count ?: 0) + 1 } ?: 1
+
+            val cnonce = generateCnonce()
+            val uri = response.request.url.encodedPath
+
+            val ha1 = hash("$username:$realm:$password")
+            val ha2 = hash("${response.request.method}:${uri}")
+            val responseHash = hash("$ha1:$nonce:$nc:$cnonce:$qop:$ha2")
+
+            val authorizationHeader = "Digest " +
+                    "username=\"$username\", " +
+                    "realm=\"$realm\", " +
+                    "nonce=\"$nonce\", " +
+                    "uri=\"$uri\", " +
+                    "qop=$qop, " +
+                    "nc=${"%08x".format(nc)}, " +
+                    "cnonce=\"$cnonce\", " +
+                    "response=\"$responseHash\", " +
+                    "opaque=\"$opaque\", " +
+                    "algorithm=\"$algorithm\""
+
+            return response.request.newBuilder()
+                .header("Authorization", authorizationHeader)
+                .build()
+        }
+
+        private fun parseChallenges(header: String): List<Challenge> {
+            val challenges = mutableListOf<Challenge>()
+            val tokens = header.split(", ")
+
+            var scheme: String? = null
+            val parameters = mutableMapOf<String, String>()
+
+            tokens.forEach { token ->
+                val parts = token.split("=")
+                if (parts.size == 2) {
+                    val key = parts[0].trim()
+                    val value = parts[1].trim().replace("\"", "")
+                    parameters[key] = value
+                } else {
+                    if (scheme != null) {
+                        challenges.add(Challenge(scheme!!, parameters.toMap()))
+                        parameters.clear()
+                    }
+                    scheme = token
+                }
+            }
+
+            if (scheme != null) {
+                challenges.add(Challenge(scheme!!, parameters.toMap()))
+            }
+
+            return challenges
+        }
+
+        private fun hash(data: String): String {
+            val md = MessageDigest.getInstance("MD5")
+            return md.digest(data.toByteArray()).joinToString("") { "%02x".format(it) }
+        }
+
+        private fun generateCnonce(): String {
+            val random = SecureRandom()
+            val bytes = ByteArray(16)
+            random.nextBytes(bytes)
+            return bytes.joinToString("") { "%02x".format(it) }
+        }
+
+        data class Challenge(val scheme: String, val parameters: Map<String, String>)
+    }
+
+    private fun buildApiService(context: Context, url: HttpUrl, creds: Pair<String, String>?): WebDavService {
+        val builder = OkHttpClient.Builder().apply {
+            if (clientCert != null || !verify) {
+                useCustomTLS(context, clientCert, verify)
+            }
+        }
+        if (noHttp2) {
+            builder.protocols(listOf(Protocol.HTTP_1_1))
+        }
+        if (BuildConfig.DEBUG) {
+            val logging = HttpLoggingInterceptor()
+            logging.level = HttpLoggingInterceptor.Level.BASIC
+            builder.addInterceptor(logging)
+        }
+        if (creds != null) {
+            val digestAuthenticator = DigestAuthenticator(creds.first, creds.second)
+            builder.authenticator(digestAuthenticator)
+        }
+
+        val serializer = buildSerializer()
+        val converter = SimpleXmlConverterFactory.create(serializer)
+        return Retrofit.Builder()
+            .baseUrl(url)
+            .client(builder.build())
+            .addConverterFactory(converter)
+            .build()
+            .create(WebDavService::class.java)
+    }
+
 }
